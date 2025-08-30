@@ -1,24 +1,20 @@
-// Staple — Component Management Plugin for Figma (Strict match only)
-// Toast now says: “All N objects attached to "Component" successfully!”
-// when everything attaches; otherwise shows a partial summary.
-
 // ---------------------------------- constants ----------------------------------
 var TARGET_KEY = 'staple/target';
 
-// Small, fixed alias sets to help strict name matching pass in common cases.
+// Name alias helpers to tolerate tiny naming differences in strict checks
 var NAME_ALIASES = [
   ["title","label","heading"],
   ["desc","subtitle","description"]
 ];
 
-// What properties we copy when strict match succeeds.
+// Properties we copy when strict match succeeds
 var COPY_SURFACE = {
   text: true,
   fills: true,
   strokes: true,
   effects: true,
   corners: true,
-  layout: true,          // only Frame->Frame
+  layout: true,
   constraints: true,
   visibilityOpacity: true
 };
@@ -34,7 +30,12 @@ function note(msg){ figma.notify(msg); }
 function absoluteXY(n){ var m=n.absoluteTransform; return {x:m[0][2], y:m[1][2]}; }
 function resizeNode(n,w,h){ try{ if(typeof n.resize==='function') n.resize(w,h); else if(typeof n.resizeWithoutConstraints==='function') n.resizeWithoutConstraints(w,h);}catch(e){} }
 function hasAncestorInstance(n){ var p=n.parent; while(p){ if(p.type==='INSTANCE') return true; p=p.parent; } return false; }
-function isAttachable(n){ return !['COMPONENT','COMPONENT_SET','INSTANCE','SLICE','STICKY','SHAPE_WITH_TEXT','PAGE','SECTION'].includes(n.type); }
+
+// allow INSTANCE as source; only exclude types Figma can’t convert
+function isConvertible(n){
+  return !['COMPONENT_SET','PAGE','SECTION','SLICE','STICKY','COMPONENT'].includes(n.type);
+}
+
 function deepClone(v){ try{ return JSON.parse(JSON.stringify(v)); }catch(e){ return v; } }
 
 function norm(s){ return (s||'').toLowerCase().replace(/\s+/g,' ').trim(); }
@@ -75,6 +76,17 @@ function structuresStrict(aRoot, bRoot){
   return walk(aRoot,bRoot);
 }
 
+// Signature for strict, order-sensitive grouping (type + normalized name + children)
+function signature(root){
+  function walk(n){
+    var self = { t:n.type, n:(n.name||'').toLowerCase().trim() };
+    var kids = childList(n);
+    self.k = kids.map(walk);
+    return self;
+  }
+  return JSON.stringify(walk(root));
+}
+
 // ---------------------------------- overrides ----------------------------------
 async function loadFontsForText(n){
   try{
@@ -87,7 +99,7 @@ async function loadFontsForText(n){
 async function copyOverrides(fromNode, toNode){
   var touched=0;
 
-  // TEXT
+  // TEXT content + style
   if (COPY_SURFACE.text && fromNode.type==='TEXT' && toNode.type==='TEXT'){
     try{ await loadFontsForText(toNode); toNode.characters=fromNode.characters; touched++; }catch(e){}
   }
@@ -125,7 +137,7 @@ async function copyOverrides(fromNode, toNode){
   return touched;
 }
 
-// Return total number of overrides applied across the strict-matched subtree.
+// Copy overrides across matched subtree
 async function copyTreeStrict(fromRoot, toRoot){
   async function walk(a,b){
     var changed = 0;
@@ -139,48 +151,140 @@ async function copyTreeStrict(fromRoot, toRoot){
   return await walk(fromRoot,toRoot);
 }
 
-// --------------------------- create component from selection --------------------
-async function createComponentFromSelection(){
+// --------------------- CREATE HELPERS (no flatten, no detach) -------------------
+// Convert a FRAME into a Component by moving kids; replace original with instance
+async function createSingleComponentFromFrame(frame){
+  var parent=frame.parent||figma.currentPage, idx=parent.children.indexOf(frame);
+  var fAbs=absoluteXY(frame);
+  var comp=figma.createComponent(); comp.name=frame.name||'Component';
+
+  var props=['fills','strokes','strokeWeight','strokeAlign','strokeCap','strokeJoin','strokeDashes','strokeGeometry','strokeMiterLimit','effects','backgrounds','cornerRadius','cornerSmoothing','paddingLeft','paddingRight','paddingTop','paddingBottom','itemSpacing','layoutMode','clipsContent','primaryAxisSizingMode','counterAxisSizingMode','primaryAxisAlignItems','counterAxisAlignItems','layoutGrids','gridStyleId'];
+  for (var i=0;i<props.length;i++){ var p=props[i]; if(p in frame){ try{ var v=frame[p]; comp[p]=(Array.isArray(v)||(typeof v==='object'&&v!==null))?JSON.parse(JSON.stringify(v)):v; }catch(e){} } }
+
+  parent.insertChild(Math.max(0,idx),comp); resizeNode(comp,frame.width,frame.height); comp.x=fAbs.x; comp.y=fAbs.y;
+  var kids=frame.children.slice();
+  for (var k=0;k<kids.length;k++){ var ch=kids[k]; var a=absoluteXY(ch); comp.appendChild(ch); ch.x=a.x-fAbs.x; ch.y=a.y-fAbs.y; }
+  frame.remove();
+
+  var inst=comp.createInstance(); parent.insertChild(Math.max(0,idx),inst);
+  inst.x=fAbs.x; inst.y=fAbs.y; resizeNode(inst,comp.width,comp.height);
+  comp.x+=40; comp.y+=40;
+  figma.currentPage.selection=[inst];
+  return {component: comp, instance: inst};
+}
+
+// Create a Component from any single node (Frame/Group/Instance/Primitive) by CLONING it
+// into the component; then replace original with an instance in place.
+async function createComponentFromSingleNodeAndReplace(node, name){
+  var parent=node.parent||figma.currentPage, idx=parent.children.indexOf(node);
+  var abs=absoluteXY(node);
+  var comp=figma.createComponent(); comp.name=name||'Component';
+  parent.insertChild(Math.max(0,idx+1),comp);
+  comp.x=abs.x+40; comp.y=abs.y+40; resizeNode(comp,node.width,node.height);
+
+  try{
+    var clone=node.clone(); comp.appendChild(clone);
+    clone.x=0; clone.y=0;
+  }catch(e){}
+
+  var inst=comp.createInstance();
+  parent.insertChild(Math.max(0,idx),inst);
+  inst.x=abs.x; inst.y=abs.y; resizeNode(inst,comp.width,comp.height);
+  try{ node.remove(); }catch(e){}
+  figma.currentPage.selection=[inst];
+  return {component: comp, instance: inst};
+}
+
+// Create an instance of given component in place of a node, copying overrides if structure matches
+async function attachNodeToComponent(node, component){
+  var parent=node.parent, idx=parent.children.indexOf(node);
+  var pos=absoluteXY(node); var w=node.width, h=node.height;
+
+  // If component is a set, choose a sensible variant by size; otherwise use component itself
+  var chosen = (function pickClosestVariant(c,w,h){
+    if (c.type==='COMPONENT') return c;
+    var set=c, best=null, score=1e15;
+    for (var i=0;i<set.children.length;i++){
+      var v=set.children[i]; if(v.type!=='COMPONENT') continue;
+      var s=Math.abs(v.width-w)+Math.abs(v.height-h);
+      if (s<score){ score=s; best=v; }
+    }
+    if (best) return best;
+    for (var j=0;j<set.children.length;j++){ if (set.children[j].type==='COMPONENT') return set.children[j]; }
+    return null;
+  })(component,w,h) || component;
+
+  var inst = chosen.createInstance();
+  parent.insertChild(idx, inst);
+  inst.x=pos.x; inst.y=pos.y; resizeNode(inst,w,h);
+
+  if (structuresStrict(node, chosen)){
+    try{ await copyTreeStrict(node, inst); }catch(e){}
+  }
+  try{ node.remove(); }catch(e){}
+  return inst;
+}
+
+// --------------------------- MERGE TO SINGLE COMPONENT --------------------------
+async function mergeToSingleFromSelection(){
   var sel=figma.currentPage.selection;
   if(!sel.length){ note('Select one or more layers first.'); return; }
 
-  if (sel.length===1 && sel[0].type==='FRAME'){
-    var frame=sel[0], parent=frame.parent||figma.currentPage, idx=parent.children.indexOf(frame);
-    var fAbs=absoluteXY(frame);
-    var comp=figma.createComponent(); comp.name=frame.name||'Component';
+  // Allow Frames, Groups, Instances, primitives; ignore nested-in-instance selections
+  var items=[];
+  for (var i=0;i<sel.length;i++){
+    var n=sel[i];
+    if (n.locked) continue;
+    if (n.parent && isConvertible(n) && !hasAncestorInstance(n)) items.push(n);
+  }
+  if (!items.length){ note('No convertible objects in the selection.'); return; }
 
-    var props=['fills','strokes','strokeWeight','strokeAlign','strokeCap','strokeJoin','strokeDashes','strokeGeometry','strokeMiterLimit','effects','backgrounds','cornerRadius','cornerSmoothing','paddingLeft','paddingRight','paddingTop','paddingBottom','itemSpacing','layoutMode','clipsContent','primaryAxisSizingMode','counterAxisSizingMode','primaryAxisAlignItems','counterAxisAlignItems','layoutGrids','gridStyleId'];
-    for (var i=0;i<props.length;i++){ var p=props[i]; if(p in frame){ try{ var v=frame[p]; comp[p]=(Array.isArray(v)||(typeof v==='object'&&v!==null))?JSON.parse(JSON.stringify(v)):v; }catch(e){} } }
-
-    parent.insertChild(Math.max(0,idx),comp); resizeNode(comp,frame.width,frame.height); comp.x=fAbs.x; comp.y=fAbs.y;
-    var kids=frame.children.slice();
-    for (var k=0;k<kids.length;k++){ var ch=kids[k]; var a=absoluteXY(ch); comp.appendChild(ch); ch.x=a.x-fAbs.x; ch.y=a.y-fAbs.y; }
-    frame.remove();
-
-    var inst=comp.createInstance(); parent.insertChild(Math.max(0,idx),inst);
-    inst.x=fAbs.x; inst.y=fAbs.y; resizeNode(inst,comp.width,comp.height);
-    comp.x+=40; comp.y+=40;
-    figma.currentPage.selection=[inst];
-    note('Created component + replaced selection with instance.');
-    return;
+  // Group by strict structure (type + names + ordered children)
+  var groups=new Map();
+  for (var j=0;j<items.length;j++){
+    var sig=signature(items[j]);
+    if (!groups.has(sig)) groups.set(sig, []);
+    groups.get(sig).push(items[j]);
   }
 
-  var minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
-  for (var j=0;j<sel.length;j++){ var n=sel[j]; var p2=absoluteXY(n); if(p2.x<minX)minX=p2.x; if(p2.y<minY)minY=p2.y; if(p2.x+n.width>maxX)maxX=p2.x+n.width; if(p2.y+n.height>maxY)maxY=p2.y+n.height; }
-  var w=Math.max(1,maxX-minX), h=Math.max(1,maxY-minY);
-  var first=sel[0], parent2=first.parent||figma.currentPage, idx2=parent2.children.indexOf(first);
+  var mergedGroups=0, singles=0, totalInstances=0;
 
-  var comp2=figma.createComponent(); comp2.name='Component';
-  parent2.insertChild(Math.max(0,idx2+1),comp2); comp2.x=minX+40; comp2.y=minY+40; resizeNode(comp2,w,h);
-  for (var t=0;t<sel.length;t++){ var n2=sel[t]; try{ var c=n2.clone(); var a2=absoluteXY(n2); comp2.appendChild(c); c.x=a2.x-minX; c.y=a2.y-minY; }catch(e){} }
-  var inst2=comp2.createInstance(); parent2.insertChild(Math.max(0,idx2),inst2);
-  inst2.x=minX; inst2.y=minY; resizeNode(inst2,w,h);
-  for (var r=0;r<sel.length;r++){ try{ sel[r].remove(); }catch(e){} }
-  figma.currentPage.selection=[inst2];
-  note('Created component + replaced selection with instance.');
+  for (const [sig, nodes] of groups){
+    var first=nodes[0];
+    var baseName=(first.name||'Component').replace(/\s+/g,' ').trim() || 'Component';
+    var comp, instFirst;
+
+    // Create the ONE component from the first node
+    if (first.type==='FRAME'){
+      var r=await createSingleComponentFromFrame(first);
+      comp=r.component; instFirst=r.instance;
+    } else {
+      var r2=await createComponentFromSingleNodeAndReplace(first, baseName);
+      comp=r2.component; instFirst=r2.instance;
+    }
+    totalInstances++;
+
+    // Attach all other nodes to that same component
+    for (var k=1;k<nodes.length;k++){
+      var inst=await attachNodeToComponent(nodes[k], comp);
+      if (inst) totalInstances++;
+    }
+
+    if (nodes.length>1) mergedGroups++; else singles++;
+    figma.currentPage.selection=[instFirst];
+  }
+
+  // Summary toast
+  if (mergedGroups>0 && singles===0){
+    note('Merged '+mergedGroups+' similar group'+(mergedGroups>1?'s':'')+' into '+mergedGroups+' single component'+(mergedGroups>1?'s':'')+' ('+totalInstances+' instance'+(totalInstances>1?'s':'')+').');
+  } else if (mergedGroups>0 && singles>0){
+    note('Merged '+mergedGroups+' group'+(mergedGroups>1?'s':'')+' and created '+singles+' single component'+(singles>1?'s':'')+' ('+totalInstances+' instance'+(totalInstances>1?'s':'')+').');
+  } else {
+    note('Created '+singles+' single component'+(singles>1?'s':'')+' ('+totalInstances+' instance'+(totalInstances>1?'s':'')+').');
+  }
 }
 
-// -------------------------------- pick target ----------------------------------
+// ------------------------------ pick target ------------------------------------
 async function pickTargetFromSelection(sel){
   for (var i=0;i<sel.length;i++) if (sel[i].type==='COMPONENT') return sel[i];
   for (var j=0;j<sel.length;j++){ var n=sel[j]; if(n.type==='INSTANCE'){ try{ var mc=await n.getMainComponentAsync(); if(mc) return mc; }catch(e){} } }
@@ -196,10 +300,11 @@ async function pickTarget(){
   note('Picked target: ' + comp.name);
 }
 
-// ------------------------------ variant choice ---------------------------------
-function pickClosestVariant(componentNode, w, h){
+// ------------------------------- link to target --------------------------------
+function pickClosestVariantForLink(componentNode, w, h){
+  // re-use in case target is a set
   if (componentNode.type==='COMPONENT') return componentNode;
-  var set = componentNode, best=null, score=1e15;
+  var set=componentNode, best=null, score=1e15;
   for (var i=0;i<set.children.length;i++){
     var v=set.children[i]; if(v.type!=='COMPONENT') continue;
     var s=Math.abs(v.width-w)+Math.abs(v.height-h);
@@ -210,7 +315,6 @@ function pickClosestVariant(componentNode, w, h){
   return null;
 }
 
-// ------------------------------- link to target --------------------------------
 async function linkToTarget(){
   var sel=figma.currentPage.selection;
   var target=null;
@@ -219,13 +323,12 @@ async function linkToTarget(){
   if(!target){ note('Pick target first (Pick Target Component), then run Link.'); return; }
 
   var attached=0, preserved=0, swapped=0, skipped=0;
-
   var nodes=[], instances=[];
   for (var i=0;i<sel.length;i++){
     var n=sel[i];
     if (n.locked){ skipped++; continue; }
     if (n.type==='INSTANCE' && n.parent && !hasAncestorInstance(n)) instances.push(n);
-    else if (n.parent && isAttachable(n) && !hasAncestorInstance(n)) nodes.push(n);
+    else if (n.parent && isConvertible(n) && !hasAncestorInstance(n)) nodes.push(n);
     else skipped++;
   }
 
@@ -237,9 +340,7 @@ async function linkToTarget(){
     var parent=node.parent, idx=parent.children.indexOf(node);
     var pos=absoluteXY(node); var w=node.width, h=node.height;
 
-    var chosen=pickClosestVariant(target,w,h); if(!chosen){ skipped++; continue; }
-
-    // Strict structure check against the COMPONENT (not the instance)
+    var chosen=pickClosestVariantForLink(target,w,h); if(!chosen){ skipped++; continue; }
     var compatible = structuresStrict(node, chosen);
 
     var inst = chosen.createInstance();
@@ -262,14 +363,14 @@ async function linkToTarget(){
   // Swap selected instances to target variant (Figma preserves overrides)
   for (var b=0;b<instances.length;b++){
     var it=instances[b];
-    var chosen2=pickClosestVariant(target,it.width,it.height); if(!chosen2){ skipped++; continue; }
+    var chosen2=pickClosestVariantForLink(target,it.width,it.height); if(!chosen2){ skipped++; continue; }
     try{ await it.swapComponent(chosen2); swapped++; }catch(e){}
   }
 
   var attachedTotal = attached + swapped;
 
   if (totalToProcess === 0) {
-    note('No attachable objects in the selection.');
+    note('No convertible objects in the selection.');
   } else if (attachedTotal === totalToProcess) {
     note('All ' + attachedTotal + ' objects attached to "' + (target.name || 'Component') + '" successfully!');
   } else {
@@ -282,7 +383,7 @@ async function linkToTarget(){
 figma.on('run', async function(ev){
   try{
     var cmd = (ev && ev.command) ? ev.command : '';
-    if (cmd==='create-component')      await createComponentFromSelection();
+    if (cmd==='create-component')      await mergeToSingleFromSelection();
     else if (cmd==='pick-target')      await pickTarget();
     else if (cmd==='link-to-target')   await linkToTarget();
     else note('Nothing to do.');
