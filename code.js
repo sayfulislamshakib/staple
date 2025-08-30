@@ -1,43 +1,33 @@
-// Staple — Component Management Plugin for Figma
-// State-preserving linking (no Settings UI). Conservative JS for Figma's VM.
+// Staple — Component Management Plugin for Figma (Strict match only)
+// Toast now says: “All N objects attached to "Component" successfully!”
+// when everything attaches; otherwise shows a partial summary.
 
-// ----------------- config -----------------
-var CFG_KEY = 'staple/config';
+// ---------------------------------- constants ----------------------------------
 var TARGET_KEY = 'staple/target';
 
-var DEFAULT_CFG = {
-  strict: false,        // strict = exact structure (type+order+names); loose = wrapper-agnostic + partial copy
-  dryRun: false,        // no changes; summary only
-  excludeRegex: '',
-  unlockTemporarily: false,
-  copy: {
-    text: true, fills: true, strokes: true, effects: true,
-    corners: true, layout: true, constraints: true, visibilityOpacity: true
-  },
-  // Fixed aliases. Edit here if needed.
-  nameAliases: [
-    ["title","label","heading"],
-    ["desc","subtitle","description"]
-  ]
+// Small, fixed alias sets to help strict name matching pass in common cases.
+var NAME_ALIASES = [
+  ["title","label","heading"],
+  ["desc","subtitle","description"]
+];
+
+// What properties we copy when strict match succeeds.
+var COPY_SURFACE = {
+  text: true,
+  fills: true,
+  strokes: true,
+  effects: true,
+  corners: true,
+  layout: true,          // only Frame->Frame
+  constraints: true,
+  visibilityOpacity: true
 };
 
-async function loadCfg() {
-  try {
-    var c = await figma.clientStorage.getAsync(CFG_KEY);
-    if (!c) return DEFAULT_CFG;
-    var cfg = JSON.parse(JSON.stringify(DEFAULT_CFG));
-    for (var k in c) cfg[k] = c[k];
-    if (!cfg.copy) cfg.copy = JSON.parse(JSON.stringify(DEFAULT_CFG.copy));
-    if (!cfg.nameAliases) cfg.nameAliases = DEFAULT_CFG.nameAliases;
-    return cfg;
-  } catch (e) { return DEFAULT_CFG; }
-}
-async function saveCfg(cfg) { try { await figma.clientStorage.setAsync(CFG_KEY, cfg || DEFAULT_CFG); } catch (e) {} }
-
+// ---------------------------------- storage ------------------------------------
 async function saveTarget(obj) { try { await figma.clientStorage.setAsync(TARGET_KEY, obj ? obj : null); } catch (e) {} }
 async function getTarget() { try { var v = await figma.clientStorage.getAsync(TARGET_KEY); return v ? v : null; } catch (e) { return null; } }
 
-// ----------------- utils -----------------
+// ---------------------------------- utils --------------------------------------
 function notifyError(e){ var m=(e && e.message)?e.message:String(e); figma.notify('Error: '+m,{error:true}); }
 function note(msg){ figma.notify(msg); }
 
@@ -47,14 +37,12 @@ function hasAncestorInstance(n){ var p=n.parent; while(p){ if(p.type==='INSTANCE
 function isAttachable(n){ return !['COMPONENT','COMPONENT_SET','INSTANCE','SLICE','STICKY','SHAPE_WITH_TEXT','PAGE','SECTION'].includes(n.type); }
 function deepClone(v){ try{ return JSON.parse(JSON.stringify(v)); }catch(e){ return v; } }
 
-// ----------------- name aliasing -----------------
 function norm(s){ return (s||'').toLowerCase().replace(/\s+/g,' ').trim(); }
-function namesEquivalent(a,b,cfg){
+function namesEquivalent(a,b){
   a = norm(a); b = norm(b);
   if (a===b) return true;
-  var groups = cfg.nameAliases || [];
-  for (var i=0;i<groups.length;i++){
-    var g = groups[i], A=false, B=false;
+  for (var i=0;i<NAME_ALIASES.length;i++){
+    var g = NAME_ALIASES[i], A=false, B=false;
     for (var j=0;j<g.length;j++){
       var v = norm(g[j]);
       if (v===a) A=true;
@@ -65,37 +53,21 @@ function namesEquivalent(a,b,cfg){
   return false;
 }
 
-// ----------------- wrappers -----------------
-function isWrapper(n){ return (n && (n.type==='FRAME' || n.type==='GROUP') && 'children' in n && n.children && n.children.length===1); }
-function unwrap(n){ var cur=n; while(isWrapper(cur)) cur=cur.children[0]; return cur; }
-function childList(n, loose){
+// Strict children (no wrapper skipping)
+function childList(n){
   if (!('children' in n) || !n.children) return [];
-  var out=[]; for (var i=0;i<n.children.length;i++){ var ch=n.children[i]; out.push(loose ? unwrap(ch) : ch); }
-  return out;
+  return n.children;
 }
 
-// ----------------- structure checks -----------------
-function structuresStrict(aRoot, bRoot, cfg){
+// Exact structure check (ignore root type, compare children)
+function structuresStrict(aRoot, bRoot){
   function walk(a,b){
-    var ac = childList(a, false), bc = childList(b, false);
+    var ac = childList(a), bc = childList(b);
     if (ac.length !== bc.length) return false;
     for (var i=0;i<ac.length;i++){
       var an=ac[i], bn=bc[i];
       if (an.type !== bn.type) return false;
-      if (!namesEquivalent(an.name||'', bn.name||'', cfg)) return false;
-      if (!walk(an,bn)) return false;
-    }
-    return true;
-  }
-  return walk(aRoot,bRoot);
-}
-function structuresLoose(aRoot, bRoot){
-  function walk(a,b){
-    var ac = childList(a, true), bc = childList(b, true);
-    if (ac.length !== bc.length) return false;
-    for (var i=0;i<ac.length;i++){
-      var an=ac[i], bn=bc[i];
-      if (an.type !== bn.type) return false;
+      if (!namesEquivalent(an.name||'', bn.name||'')) return false;
       if (!walk(an,bn)) return false;
     }
     return true;
@@ -103,23 +75,7 @@ function structuresLoose(aRoot, bRoot){
   return walk(aRoot,bRoot);
 }
 
-// For partial copy we align by order+type (loose), ignoring names and wrappers
-function alignedPairs(aRoot, bRoot){
-  var pairs=[];
-  function walk(a,b){
-    var ac=childList(a,true), bc=childList(b,true);
-    var len=Math.min(ac.length, bc.length);
-    for (var i=0;i<len;i++){
-      var an=ac[i], bn=bc[i];
-      if (an.type===bn.type){ pairs.push([an,bn]); walk(an,bn); }
-    }
-  }
-  walk(aRoot,bRoot);
-  return pairs;
-}
-
-
-// ----------------- overrides -----------------
+// ---------------------------------- overrides ----------------------------------
 async function loadFontsForText(n){
   try{
     var len=n.characters ? n.characters.length : 0;
@@ -128,33 +84,34 @@ async function loadFontsForText(n){
   }catch(e){}
 }
 
-async function copyOverrides(fromNode, toNode, cfg){
-  var touched=0, c=cfg.copy;
+async function copyOverrides(fromNode, toNode){
+  var touched=0;
 
-  if (c.text && fromNode.type==='TEXT' && toNode.type==='TEXT'){
+  // TEXT
+  if (COPY_SURFACE.text && fromNode.type==='TEXT' && toNode.type==='TEXT'){
     try{ await loadFontsForText(toNode); toNode.characters=fromNode.characters; touched++; }catch(e){}
   }
 
-  if (c.visibilityOpacity){
+  if (COPY_SURFACE.visibilityOpacity){
     try{ if('visible'in toNode && 'visible'in fromNode){ toNode.visible=fromNode.visible; touched++; } }catch(e){}
     try{ if('opacity'in toNode && 'opacity'in fromNode){ toNode.opacity=fromNode.opacity; touched++; } }catch(e){}
   }
 
-  if (c.fills){ try{ if('fills'in toNode && 'fills'in fromNode){ toNode.fills=deepClone(fromNode.fills); touched++; } }catch(e){} }
-  if (c.strokes){
+  if (COPY_SURFACE.fills){ try{ if('fills'in toNode && 'fills'in fromNode){ toNode.fills=deepClone(fromNode.fills); touched++; } }catch(e){} }
+  if (COPY_SURFACE.strokes){
     try{ if('strokes'in toNode && 'strokes'in fromNode){ toNode.strokes=deepClone(fromNode.strokes); touched++; } }catch(e){}
     try{ if('strokeWeight'in toNode && 'strokeWeight'in fromNode){ toNode.strokeWeight=fromNode.strokeWeight; touched++; } }catch(e){}
   }
-  if (c.effects){ try{ if('effects'in toNode && 'effects'in fromNode){ toNode.effects=deepClone(fromNode.effects); touched++; } }catch(e){} }
+  if (COPY_SURFACE.effects){ try{ if('effects'in toNode && 'effects'in fromNode){ toNode.effects=deepClone(fromNode.effects); touched++; } }catch(e){} }
 
-  if (c.corners){
+  if (COPY_SURFACE.corners){
     try{ if('cornerRadius'in toNode && 'cornerRadius'in fromNode){ toNode.cornerRadius=fromNode.cornerRadius; touched++; } }catch(e){}
     try{ if('cornerSmoothing'in toNode && 'cornerSmoothing'in fromNode){ toNode.cornerSmoothing=fromNode.cornerSmoothing; touched++; } }catch(e){}
   }
 
-  if (c.constraints){ try{ if('constraints'in toNode && 'constraints'in fromNode){ toNode.constraints=deepClone(fromNode.constraints); touched++; } }catch(e){} }
+  if (COPY_SURFACE.constraints){ try{ if('constraints'in toNode && 'constraints'in fromNode){ toNode.constraints=deepClone(fromNode.constraints); touched++; } }catch(e){} }
 
-  if (c.layout && toNode.type==='FRAME' && fromNode.type==='FRAME'){
+  if (COPY_SURFACE.layout && toNode.type==='FRAME' && fromNode.type==='FRAME'){
     try{ toNode.layoutMode = fromNode.layoutMode; touched++; }catch(e){}
     try{ toNode.itemSpacing = fromNode.itemSpacing; touched++; }catch(e){}
     try{ toNode.paddingLeft = fromNode.paddingLeft; touched++; }catch(e){}
@@ -168,26 +125,21 @@ async function copyOverrides(fromNode, toNode, cfg){
   return touched;
 }
 
-async function copyTreeStrict(fromRoot, toRoot, cfg){
+// Return total number of overrides applied across the strict-matched subtree.
+async function copyTreeStrict(fromRoot, toRoot){
   async function walk(a,b){
-    var ac=childList(a,false), bc=childList(b,false);
+    var changed = 0;
+    var ac=childList(a), bc=childList(b);
     for (var i=0;i<ac.length;i++){
-      await copyOverrides(ac[i], bc[i], cfg);
-      await walk(ac[i], bc[i]);
+      changed += await copyOverrides(ac[i], bc[i]);
+      changed += await walk(ac[i], bc[i]);
     }
+    return changed;
   }
-  await walk(fromRoot,toRoot);
-}
-async function copyTreeLoosePartial(fromRoot, toRoot, cfg){
-  var pairs=alignedPairs(fromRoot,toRoot);
-  var changed=0;
-  for (var i=0;i<pairs.length;i++){
-    changed += await copyOverrides(pairs[i][0], pairs[i][1], cfg);
-  }
-  return changed;
+  return await walk(fromRoot,toRoot);
 }
 
-// ----------------- create component (unchanged) -----------------
+// --------------------------- create component from selection --------------------
 async function createComponentFromSelection(){
   var sel=figma.currentPage.selection;
   if(!sel.length){ note('Select one or more layers first.'); return; }
@@ -228,7 +180,7 @@ async function createComponentFromSelection(){
   note('Created component + replaced selection with instance.');
 }
 
-// ----------------- pick target -----------------
+// -------------------------------- pick target ----------------------------------
 async function pickTargetFromSelection(sel){
   for (var i=0;i<sel.length;i++) if (sel[i].type==='COMPONENT') return sel[i];
   for (var j=0;j<sel.length;j++){ var n=sel[j]; if(n.type==='INSTANCE'){ try{ var mc=await n.getMainComponentAsync(); if(mc) return mc; }catch(e){} } }
@@ -244,7 +196,7 @@ async function pickTarget(){
   note('Picked target: ' + comp.name);
 }
 
-// ----------------- variant choice -----------------
+// ------------------------------ variant choice ---------------------------------
 function pickClosestVariant(componentNode, w, h){
   if (componentNode.type==='COMPONENT') return componentNode;
   var set = componentNode, best=null, score=1e15;
@@ -258,45 +210,37 @@ function pickClosestVariant(componentNode, w, h){
   return null;
 }
 
-// ----------------- link (dry-run + strict/loose + partial) -----------------
+// ------------------------------- link to target --------------------------------
 async function linkToTarget(){
-  var cfg = await loadCfg();
-
   var sel=figma.currentPage.selection;
   var target=null;
   var saved=await getTarget(); if(saved){ try{ target=await figma.getNodeByIdAsync(saved.nodeId); }catch(e){} }
   if(!target){ target=await pickTargetFromSelection(sel); }
   if(!target){ note('Pick target first (Pick Target Component), then run Link.'); return; }
 
-  var rx=null;
-  if (cfg.excludeRegex){ try{ rx=new RegExp(cfg.excludeRegex, 'i'); }catch(e){ rx=null; } }
-
-  var attached=0, preserved=0, partial=0, swapped=0, skipped=0;
+  var attached=0, preserved=0, swapped=0, skipped=0;
 
   var nodes=[], instances=[];
   for (var i=0;i<sel.length;i++){
     var n=sel[i];
-    if (rx && rx.test(n.name||'')){ skipped++; continue; }
-    if (n.locked){ if(cfg.unlockTemporarily){ try{ n.locked=false; }catch(e){} } else { skipped++; continue; } }
+    if (n.locked){ skipped++; continue; }
     if (n.type==='INSTANCE' && n.parent && !hasAncestorInstance(n)) instances.push(n);
     else if (n.parent && isAttachable(n) && !hasAncestorInstance(n)) nodes.push(n);
     else skipped++;
   }
 
-  // Convert nodes into instances
+  var totalToProcess = nodes.length + instances.length;
+
+  // Convert regular nodes into instances (strict only)
   for (var a=0;a<nodes.length;a++){
     var node=nodes[a];
     var parent=node.parent, idx=parent.children.indexOf(node);
     var pos=absoluteXY(node); var w=node.width, h=node.height;
 
     var chosen=pickClosestVariant(target,w,h); if(!chosen){ skipped++; continue; }
-    var compatible = cfg.strict ? structuresStrict(node, chosen, cfg) : structuresLoose(node, chosen);
 
-    if (cfg.dryRun){
-      if (compatible) preserved++; else partial++;
-      attached++;
-      continue;
-    }
+    // Strict structure check against the COMPONENT (not the instance)
+    var compatible = structuresStrict(node, chosen);
 
     var inst = chosen.createInstance();
     try{
@@ -304,10 +248,8 @@ async function linkToTarget(){
       inst.x=pos.x; inst.y=pos.y; resizeNode(inst,w,h);
 
       if (compatible){
-        await copyTreeStrict(node, inst, cfg); preserved++;
-      } else {
-        var changed = await copyTreeLoosePartial(node, inst, cfg);
-        if (changed>0){ partial++; }
+        var changed = await copyTreeStrict(node, inst);
+        if (changed > 0) preserved++;
       }
 
       node.remove(); attached++;
@@ -317,33 +259,32 @@ async function linkToTarget(){
     }
   }
 
-  // Swap instances (Figma preserves overrides on swap)
+  // Swap selected instances to target variant (Figma preserves overrides)
   for (var b=0;b<instances.length;b++){
     var it=instances[b];
     var chosen2=pickClosestVariant(target,it.width,it.height); if(!chosen2){ skipped++; continue; }
-    if (cfg.dryRun){ swapped++; continue; }
     try{ await it.swapComponent(chosen2); swapped++; }catch(e){}
   }
 
-  var msg=[];
-  if (attached) msg.push('linked '+attached);
-  if (preserved) msg.push('preserved '+preserved);
-  if (partial) msg.push('partial '+partial);
-  if (swapped) msg.push('swapped '+swapped+' selected');
-  if (skipped) msg.push(skipped+' skipped');
-  if (cfg.dryRun) msg.push('DRY-RUN');
-  note(msg.length? msg.join(' · ') : 'No changes.');
+  var attachedTotal = attached + swapped;
+
+  if (totalToProcess === 0) {
+    note('No attachable objects in the selection.');
+  } else if (attachedTotal === totalToProcess) {
+    note('All ' + attachedTotal + ' objects attached to "' + (target.name || 'Component') + '" successfully!');
+  } else {
+    note(attachedTotal + ' of ' + totalToProcess + ' objects attached to "' + (target.name || 'Component') + '". ' +
+         (preserved ? (preserved + ' preserved, ') : '') + skipped + ' skipped.');
+  }
 }
 
-// ----------------- command router -----------------
+// ---------------------------------- router -------------------------------------
 figma.on('run', async function(ev){
   try{
     var cmd = (ev && ev.command) ? ev.command : '';
     if (cmd==='create-component')      await createComponentFromSelection();
     else if (cmd==='pick-target')      await pickTarget();
     else if (cmd==='link-to-target')   await linkToTarget();
-    else if (cmd==='toggle-strict')    { var c=await loadCfg(); c.strict=!c.strict; await saveCfg(c); note('Strict matching: '+(c.strict?'ON':'OFF')); }
-    else if (cmd==='toggle-dry')       { var d=await loadCfg(); d.dryRun=!d.dryRun; await saveCfg(d); note('Dry run: '+(d.dryRun?'ON':'OFF')); }
     else note('Nothing to do.');
   } catch (e) { notifyError(e); }
   finally { setTimeout(function(){ try{ figma.closePlugin(); }catch(e){} }, 0); }

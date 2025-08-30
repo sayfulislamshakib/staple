@@ -9,9 +9,6 @@
     { "name": "Create Component from objects", "command": "create-component" },
     { "separator": true },
     { "name": "Pick Target Component", "command": "pick-target" },
-    { "name": "Link Objects to Target Component", "command": "link-to-target" },
-    { "separator": true },
-    { "name": "Toggle Strict Matching", "command": "toggle-strict" },
-    { "name": "Toggle Dry Run", "command": "toggle-dry" }
+    { "name": "Link Objects to Target Component", "command": "link-to-target" }
   ]
 }
